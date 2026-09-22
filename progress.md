@@ -13,12 +13,34 @@ entry — supersede it.
 
 | | |
 |---|---|
-| **Phase** | P0 — Confirm & de-risk |
-| **Overall status** | Pre-development — planning complete, no code written |
-| **Current slice** | Slice 1 (walking skeleton) — *proposed, not started* |
-| **FRs complete** | 0 of 41 (1 superseded) |
+| **Phase** | P1 — Foundation |
+| **Overall status** | Slice 1 built; ingestion verified against live sources; DB path awaiting Docker |
+| **Current slice** | Slice 1 (walking skeleton) — **code complete, partially verified** |
+| **FRs complete** | 2 of 41 (FR-1, FR-4) · 2 partial (FR-2, FR-6) · 1 superseded (FR-7) |
+| **Tests** | 34 passing · packages typecheck clean · `next build` clean |
 | **Hard launch blockers cleared** | 0 of 4 |
 | **Last updated** | 2026-09-22 |
+
+### Slice 1 status
+
+> A visitor can open an LGU profile page and see that LGU's real infrastructure
+> projects, each row linking to the source record, stamped with data vintage
+> and the standing disclaimer.
+
+| Step | State |
+|---|---|
+| PSGC spine ingested from live API | **Done** — 1,758 rows, 18 reg / 82 prov / 150 city / 1,493 mun |
+| Immutable checksummed snapshots | **Done** — verified round-trip + tamper detection |
+| Infrastructure feed ingested | **Done** — all 25,452 records |
+| Entity resolution | **Partial** — 36.0% attributed; ceiling without geometry is 41.9% |
+| Schema + RLS migration | **Written**, not yet applied (needs Docker) |
+| Snapshot → Postgres loader | **Written**, not yet run (needs Docker) |
+| LGU profile page + disclaimer | **Done** — renders; serves setup state without a DB |
+
+**Blocked on:** Docker Desktop is not running and the Supabase CLI is not
+installed, so the migration has never been applied and the page has not yet
+rendered real rows. Everything upstream of Postgres is verified against live
+sources.
 
 **P0 exit criteria** (PRD §13): all §14 blocking items closed · architecture ADR written ·
 legal counsel engaged · brand inputs received.
@@ -43,11 +65,11 @@ legal counsel engaged · brand inputs received.
 
 | FR | Deliverable | Status |
 |---|---|---|
-| — | Monorepo scaffold, self-hosted Supabase, RLS baseline, CI | Not started |
-| FR-1 | PSGC spine loader (Q2_2024 — 18 reg / 82 prov / 33 HUC-ICC / 1,623 mun-city) | Not started |
-| FR-2 | Deterministic PSGC matcher with quarantine | Not started |
-| FR-3 | HDX geometry import + province→region `ST_Union` dissolve + tiles | Not started |
-| FR-39 | PSGC split / merge / create / rename handling | Not started |
+| — | Monorepo scaffold, RLS baseline migration | **Done** (migration written, not applied) |
+| FR-1 | PSGC spine loader (Q2_2024) | **Done** — 1,758 rows; mojibake + orphan repairs |
+| FR-2 | Deterministic PSGC matcher with quarantine | **Partial** — code/alias/name/trigram done; point-in-polygon blocked on FR-3 |
+| FR-3 | HDX geometry import + province→region `ST_Union` dissolve + tiles | Not started — **now the top constraint** |
+| FR-39 | PSGC split / merge / create / rename handling | Partial — orphan reattachment done (Pateros) |
 | — | Dynasties-geography → PSGC crossmap (88/1,767 → 82/1,656) | Not started |
 
 _Gate:_ ≥ 98% record resolution · Dynasties crossmap explained · dissolved region layer
@@ -57,10 +79,10 @@ reproduces all 18 PSGC regions including NIR.
 
 | FR | Deliverable | Status |
 |---|---|---|
-| FR-4 | Immutable checksummed snapshot framework | Not started |
-| FR-40 | Last-good-snapshot serving; no partial promotion | Not started |
+| FR-4 | Immutable checksummed snapshot framework | **Done** — canonical hashing, refuses overwrite, verifies on read |
+| FR-40 | Last-good-snapshot serving; no partial promotion | **Done** — `latest` advances only on a successful run |
 | FR-5 | Budget connector (GAA FY2020–26, NEP FY2027) | Not started |
-| FR-6 | Infrastructure projects connector (25,452 records) | Not started |
+| FR-6 | Infrastructure projects connector (25,452 records) | **Done** — float→centavos, bounds checks, quality flags |
 | ~~FR-7~~ | ~~DPWH connector~~ | **Superseded** — source dead; rewritten as coverage-verification task |
 | FR-8 | PSA statistics connector (5,000-point query limit) | Not started |
 | FR-9 | Dynasties connector — persons / contests / blocs / places | Not started |
@@ -141,12 +163,35 @@ Health as last verified. Update `Last verified` whenever a connector runs or a s
 
 Each needs a connector-boundary guard and a test. Tick when the guard exists.
 
-- [ ] Monetary values arrive as **floats** (`1447499996.23`) — convert to integer centavos
-- [ ] Populations arrive as **strings with spaces and commas** (`" 593,081 "`)
-- [ ] **Administrative pseudo-locations** (`"Flood Control Management Cluster"`) — no name match possible; needs point-in-polygon
-- [ ] **Internally contradictory records** (`status: On-Going` + `progress: 100` + `amountPaid: 0`) — surface, don't score
+- [x] Monetary values arrive as **floats** (`1447499996.23`) — `toCentavos` parses decimal text, never multiplies floats
+- [x] Populations arrive as **strings with spaces and commas** (`" 593,081 "`) — `parseCount`
+- [x] **Administrative pseudo-locations** — detected and routed away from name matching
+- [x] **Internally contradictory records** — flagged `complete-but-unpaid`; **16,909 records affected (66.4%)**
+- [x] **Double-encoded UTF-8 in place names** — *found during the build*, see below
+- [x] **`location.province` is not a province** — *found during the build*, see below
 - [ ] **Candidate data absent before 2010** — unopposed-rate/margin only computable 2010+; must reduce Data Coverage
 - [ ] **HDX pcodes are 2023-vintage** vs Q2_2024 spine — alias reconciliation required
+
+### Two landmines found while building slice 1
+
+**The PSGC API serves double-encoded UTF-8.** "City of Las Piñas" arrives as
+"City of Las PiÃ±as" — the original `ñ` (U+00F1) was decoded as Latin-1 and
+re-encoded. 18 spine rows are affected (Las Piñas, Parañaque, Peñablanca, Santo
+Niño, Doña Remedios Trinidad, Science City of Muñoz…). Left alone this defeats
+name matching, breaks the Ñ handling FR-29 requires, and would put visibly
+wrong place names on the public site. Repaired at the connector boundary
+(`repairMojibake`) and covered by tests.
+
+**The infrastructure feed's `location.province` is not a province.** It is the
+DPWH implementing office. Across all 25,452 records: 51.1% name only a region
+("Region V"), 41.9% a district office ("Abra DEO", "Camarines Sur 5th DEO"),
+7.0% a pseudo-location. **100% carry valid coordinates.**
+
+This is the strongest evidence yet for plan.md §2: without boundary geometry,
+**58% of project records cannot reach any LGU at all**, and the P1 procurement
+pillar would be computed over a skewed 42% subset. Name-based resolution
+currently attributes 36.0% — about 86% of the achievable ceiling. The rest is
+not a tuning problem; it is the geometry gap.
 
 ---
 
@@ -160,6 +205,7 @@ Each needs a connector-boundary guard and a test. Tick when the guard exists.
 | B4 | **Legal counsel engaged** | Public launch | client | 2026-09-22 |
 | B5 | **Budget / timeline / team envelope** | Phase planning; now also an **ops role** (self-hosting, plan.md §5.1) | client | 2026-09-22 |
 | B6 | **Editorial staffing** for the moderation queue | Epic E go-live | client | 2026-09-22 |
+| B7 | **Docker Desktop not running + Supabase CLI not installed** | Applying migrations; the last step of slice 1 | dev machine | 2026-09-22 |
 
 _Cleared:_ DPWH API contract · Juris.ph API contract · officials API contract · academic dynasty
 dataset selection · boundary geometry source selection (all 2026-09-22).
@@ -211,6 +257,13 @@ Append-only. Supersede rather than edit.
 | D9 | 2026-09-22 | **Do not ingest HDX's region layer.** Dissolve provinces → regions on PSGC parent code via `ST_Union` | HDX removed Negros Island Region; PSGC Q2_2024 has it as `1800000000` |
 | D10 | 2026-09-22 | Dynasties geography (88/1,767) is **mapped onto** the PSGC spine, never adopted as it | Two sources, two geographies; PSGC is authoritative |
 | D11 | 2026-09-22 | Point-in-polygon matches carry **lower confidence** than code matches in FR-2 | HDX boundaries are indicative, not official (OCHA) |
+| D12 | 2026-09-22 | Money is a branded `Centavos` type parsed from **decimal text**, never float multiplication | `1447499996.23 * 100` is not exact in IEEE-754 |
+| D13 | 2026-09-22 | Ambiguous name matches **quarantine rather than pick a candidate** | Guessing attributes one LGU's spending to another; a quarantined row is a 5-minute steward review |
+| D14 | 2026-09-22 | A bare province name in a DPWH office means the **province**; an explicit "City" means the **city** | Cebu/Iloilo/Isabela/Cavite/Tarlac/Quezon each name both a province and a city; this recovered 2,574 records |
+| D15 | 2026-09-22 | Repair double-encoded UTF-8 at the connector boundary | 18 spine rows arrive mangled; see §3 |
+| D16 | 2026-09-22 | Region-level implementing offices resolve to **nothing**, not to an arbitrary LGU inside the region | Attributing a region's whole spend to one municipality would be fabrication |
+| D17 | 2026-09-22 | Pin `@supabase/supabase-js` to **2.116.0** | 2.117.0 pins `auth-js@2.117.0` exactly, which was never published — the latest release is uninstallable |
+| D18 | 2026-09-22 | Pateros reattached to NCR when its derived PSGC parent is unpublished | An LGU that exists must be scorable and must roll up |
 
 ---
 
@@ -222,15 +275,30 @@ Append-only. Supersede rather than edit.
 | 2026-09-22 | Build plan authored | [`plan.md`](./plan.md) — 41 FRs mapped to 6 epics, Slice 1 defined |
 | 2026-09-22 | Boundary geometry research | HDX COD-AB selected; licence trap in MIT-labelled alternatives documented |
 | 2026-09-22 | Progress tracker created | This file |
+| 2026-09-22 | Slice 1 built | Monorepo, snapshots, 2 connectors, resolution, schema + RLS, LGU profile. 34 tests, typecheck and build clean |
+| 2026-09-22 | Live ingestion runs | 1,758 spine rows · 25,452 projects · 36.0% attributed |
 
 ---
 
 ## 9. Next up
 
-**Slice 1 — the walking skeleton** ([plan.md §4](./plan.md)):
-> A visitor can open an LGU profile page and see that LGU's real infrastructure projects, each
-> row linking to the source record it came from, stamped with the data vintage and the standing
-> disclaimer.
+**Immediate — to finish verifying slice 1.** Start Docker Desktop and install the
+Supabase CLI, then:
 
-Needs neither geometry nor brand to begin. Competing candidate for first work: the architecture
-ADR (ingestion orchestration), made more pressing by the self-hosting decision (D2).
+```
+npx supabase start
+npx supabase db reset            # applies migrations + RLS
+npm run load                     # snapshot → Postgres
+npm run dev
+```
+
+Snapshots are already on disk, so nothing needs re-fetching.
+
+**Then, in priority order:**
+
+1. **FR-3 boundary geometry.** Now the single largest constraint on the product,
+   not merely on the map — it is what unlocks the other 58% of project records
+   (§3). Needs only the counsel sign-off on CC BY-IGO (B1) to proceed.
+2. **FR-5 budget connector** — the P2 pillar. Unblocked today.
+3. **FR-9 Dynasties connector** — the P3 pillar. Unblocked today.
+4. **Architecture ADR** — ingestion orchestration, sharpened by self-hosting (D2).

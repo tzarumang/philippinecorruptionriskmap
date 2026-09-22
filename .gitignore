@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit. Only .env.example belongs in git.
+.env
+.env.local
+.env.*.local
+
+# Build output
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Ingestion snapshots: large, and reproducible by re-running the connectors.
+# Not committed. Reproducibility comes from the checksum recorded in
+# ingestion_snapshot, not from keeping the payload in git.
+/data/snapshots/*
+!/data/snapshots/.gitkeep
+
+# Supabase local stack
+supabase/.branches/
+supabase/.temp/
+
+# Test + tooling
+coverage/
+.eslintcache
+
+# OS
+.DS_Store
+Thumbs.db
