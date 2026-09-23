@@ -14,12 +14,12 @@ entry — supersede it.
 | | |
 |---|---|
 | **Phase** | P1 — Foundation |
-| **Overall status** | Slice 1 built; ingestion verified against live sources; DB path awaiting Docker |
-| **Current slice** | Slice 1 (walking skeleton) — **code complete, partially verified** |
-| **FRs complete** | 2 of 41 (FR-1, FR-4) · 2 partial (FR-2, FR-6) · 1 superseded (FR-7) |
+| **Overall status** | **Slice 1 complete and verified end to end** against a live database |
+| **Current slice** | Slice 1 (walking skeleton) — **done** |
+| **FRs complete** | 3 of 41 (FR-1, FR-4, FR-40) · 2 partial (FR-2, FR-6) · 1 superseded (FR-7) |
 | **Tests** | 34 passing · packages typecheck clean · `next build` clean |
 | **Hard launch blockers cleared** | 0 of 4 |
-| **Last updated** | 2026-09-22 |
+| **Last updated** | 2026-09-23 |
 
 ### Slice 1 status
 
@@ -31,16 +31,20 @@ entry — supersede it.
 |---|---|
 | PSGC spine ingested from live API | **Done** — 1,758 rows, 18 reg / 82 prov / 150 city / 1,493 mun |
 | Immutable checksummed snapshots | **Done** — verified round-trip + tamper detection |
-| Infrastructure feed ingested | **Done** — all 25,452 records |
-| Entity resolution | **Partial** — 36.0% attributed; ceiling without geometry is 41.9% |
-| Schema + RLS migration | **Written**, not yet applied (needs Docker) |
-| Snapshot → Postgres loader | **Written**, not yet run (needs Docker) |
-| LGU profile page + disclaimer | **Done** — renders; serves setup state without a DB |
+| Infrastructure feed ingested | **Done** — 25,452 **distinct** records via bbox quadtree (92 tiles) |
+| Entity resolution | **80.7% attributed** (20,548 of 25,452) across 82 LGUs |
+| Schema + RLS migration | **Applied** — 4 tables + 1 view, RLS verified |
+| Snapshot → Postgres loader | **Run** — 2.2s |
+| LGU profile page + disclaimer | **Done** — renders real records with per-row attribution |
 
-**Blocked on:** Docker Desktop is not running and the Supabase CLI is not
-installed, so the migration has never been applied and the page has not yet
-rendered real rows. Everything upstream of Postgres is verified against live
-sources.
+**Verified against a live database on 2026-09-23:**
+
+- anon reads spine (1,758) and projects (25,452); reads **0** quarantine rows
+- anon `insert` rejected — *"new row violates row-level security policy"*
+- RLS enabled on all four tables; the summary view is `security_invoker = true`
+- Homepage lists all 82 LGUs (Bulacan 1,645 projects · ₱89.3B)
+- Profile renders real contracts with attribution shown per row
+  ("exact-name via Bulacan 1st DEO") and quality flags
 
 **P0 exit criteria** (PRD §13): all §14 blocking items closed · architecture ADR written ·
 legal counsel engaged · brand inputs received.
@@ -183,15 +187,43 @@ wrong place names on the public site. Repaired at the connector boundary
 (`repairMojibake`) and covered by tests.
 
 **The infrastructure feed's `location.province` is not a province.** It is the
-DPWH implementing office. Across all 25,452 records: 51.1% name only a region
-("Region V"), 41.9% a district office ("Abra DEO", "Camarines Sur 5th DEO"),
-7.0% a pseudo-location. **100% carry valid coordinates.**
+DPWH implementing office — a region ("Region V"), a District Engineering Office
+("Abra DEO", "Camarines Sur 5th DEO"), or an administrative unit
+("Flood Control Management Cluster"). Every record carries coordinates.
 
-This is the strongest evidence yet for plan.md §2: without boundary geometry,
-**58% of project records cannot reach any LGU at all**, and the P1 procurement
-pillar would be computed over a skewed 42% subset. Name-based resolution
-currently attributes 36.0% — about 86% of the achievable ceiling. The rest is
-not a tuning problem; it is the geometry gap.
+Name-based resolution now attributes **80.7%** (20,548 of 25,452) across 82
+LGUs. The residual ~19% is almost entirely region-level offices, which
+genuinely do not identify an LGU and need point-in-polygon against boundary
+geometry (FR-3).
+
+### The feed ignores `offset` — pagination is geographic
+
+**Found after the first load reported wrong numbers.** The endpoint caps a
+response at 1,000 hits and silently ignores `offset`, echoing `offset: 0`
+whatever is sent; `page`, `from`, `skip`, `start` and `cursor` are ignored too.
+Naive offset paging therefore re-fetches page one forever — the first snapshot
+held 25,452 rows but only **1,000 distinct** projects, each repeated ~25 times.
+Upserting on the natural key collapsed them back to 1,000, which is what
+exposed it.
+
+The site's own frontend calls the endpoint with `q`, `limit`, `zoom` and
+**`bbox`**, and the response's `searchStrategy` flips from `postgis-national`
+to `postgis-bbox-gist` when a bbox is given. Geography *is* the pagination.
+Since every record has coordinates, the connector now harvests by recursively
+subdividing the Philippine bounding box until each tile fits under the cap —
+92 tiles, deduplicated by `contractId`, reaching all 25,452 distinct records.
+
+**Corrected figures.** Earlier entries in this file reported 36.0% attribution,
+1,779 pseudo-locations and a 41.9% ceiling. Those were computed over the
+duplicated 1,000-record sample and were wrong. Against the full distinct set:
+**80.7% attributed**, 124 pseudo-locations, and 23,111 of 25,452 records
+(**90.8%**) flagged `complete-but-unpaid`.
+
+That last figure is worth a second look before it informs any indicator: 90.8%
+of projects reporting 100% progress with nothing disbursed suggests
+`amountPaid` is largely unpopulated upstream rather than genuinely zero. The
+payment-ahead-of-progress indicator in P1 depends on this field and should not
+be built until it is understood.
 
 ---
 
@@ -205,7 +237,7 @@ not a tuning problem; it is the geometry gap.
 | B4 | **Legal counsel engaged** | Public launch | client | 2026-09-22 |
 | B5 | **Budget / timeline / team envelope** | Phase planning; now also an **ops role** (self-hosting, plan.md §5.1) | client | 2026-09-22 |
 | B6 | **Editorial staffing** for the moderation queue | Epic E go-live | client | 2026-09-22 |
-| B7 | **Docker Desktop not running + Supabase CLI not installed** | Applying migrations; the last step of slice 1 | dev machine | 2026-09-22 |
+| ~~B7~~ | ~~Docker not running + Supabase CLI missing~~ | — | — | **Cleared 2026-09-23** |
 
 _Cleared:_ DPWH API contract · Juris.ph API contract · officials API contract · academic dynasty
 dataset selection · boundary geometry source selection (all 2026-09-22).
@@ -264,6 +296,10 @@ Append-only. Supersede rather than edit.
 | D16 | 2026-09-22 | Region-level implementing offices resolve to **nothing**, not to an arbitrary LGU inside the region | Attributing a region's whole spend to one municipality would be fabrication |
 | D17 | 2026-09-22 | Pin `@supabase/supabase-js` to **2.116.0** | 2.117.0 pins `auth-js@2.117.0` exactly, which was never published — the latest release is uninstallable |
 | D18 | 2026-09-22 | Pateros reattached to NCR when its derived PSGC parent is unpublished | An LGU that exists must be scorable and must roll up |
+| D19 | 2026-09-23 | Harvest the infrastructure feed by **recursive bbox subdivision**, deduplicated by `contractId` | The endpoint ignores `offset`; geography is its only pagination |
+| D20 | 2026-09-23 | Per-LGU aggregates come from a **`security_invoker` view**, not client-side counting | Counting a bounded page in JS silently reported 2 of 82 LGUs; a default view would also bypass RLS |
+| D21 | 2026-09-23 | One `.env.local` at the repo root, loaded by `next.config.mjs` | Two copies is how one goes stale or gets committed |
+| D22 | 2026-09-23 | PCRM's local Supabase runs on ports **54421–54429** | 54321/54322 are held by another live project on this machine (`axionhr`); `supabase stop` would have killed someone else's work |
 
 ---
 
@@ -276,25 +312,25 @@ Append-only. Supersede rather than edit.
 | 2026-09-22 | Boundary geometry research | HDX COD-AB selected; licence trap in MIT-labelled alternatives documented |
 | 2026-09-22 | Progress tracker created | This file |
 | 2026-09-22 | Slice 1 built | Monorepo, snapshots, 2 connectors, resolution, schema + RLS, LGU profile. 34 tests, typecheck and build clean |
-| 2026-09-22 | Live ingestion runs | 1,758 spine rows · 25,452 projects · 36.0% attributed |
+| 2026-09-22 | Live ingestion runs | 1,758 spine rows; project figures later found wrong (see below) |
+| 2026-09-23 | Found the feed ignores `offset` | First snapshot held 1,000 distinct records, not 25,452. Rebuilt as a bbox quadtree harvest |
+| 2026-09-23 | Slice 1 verified end to end | Migrations applied, 25,452 projects loaded, RLS verified, both pages render real data |
 
 ---
 
 ## 9. Next up
 
-**Immediate — to finish verifying slice 1.** Start Docker Desktop and install the
-Supabase CLI, then:
+Slice 1 is done. Local setup, once Docker is running:
 
 ```
-npx supabase start
-npx supabase db reset            # applies migrations + RLS
-npm run load                     # snapshot → Postgres
+npx supabase start               # ports 54421–54429, see D22
+npm run ingest -- --source=psgc
+npm run ingest -- --source=infrastructure
+npm run load
 npm run dev
 ```
 
-Snapshots are already on disk, so nothing needs re-fetching.
-
-**Then, in priority order:**
+**In priority order:**
 
 1. **FR-3 boundary geometry.** Now the single largest constraint on the product,
    not merely on the map — it is what unlocks the other 58% of project records

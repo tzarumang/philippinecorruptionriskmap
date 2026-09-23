@@ -36,8 +36,48 @@ const ENDPOINT = 'https://flood-control.bettergov.ph/api/flood-control-projects'
 /** Philippine bounding box, per FR-6. */
 const PH_BOUNDS = { minLat: 4.2, maxLat: 21.4, minLon: 116.0, maxLon: 127.0 };
 
-/** Meilisearch caps a page at 1000 hits. */
-const PAGE_SIZE = 1000;
+/**
+ * The server caps a response at 1000 hits and IGNORES `offset` — it echoes
+ * `offset: 0` whatever you send, so naive offset paging silently re-fetches
+ * page one forever. `page`, `from`, `skip`, `start` and `cursor` are ignored
+ * too.
+ *
+ * This endpoint is a map-viewport search: the site's own frontend calls it
+ * with `q`, `limit`, `zoom` and `bbox`, and the response's `searchStrategy`
+ * flips from "postgis-national" to "postgis-bbox-gist" once a bbox is given.
+ * So GEOGRAPHY is the pagination mechanism, and the only way to reach every
+ * record is to tile the country.
+ *
+ * Every record in this feed carries coordinates, so a quadtree harvest is
+ * exhaustive: subdivide any tile whose total exceeds the cap, and collect the
+ * ones that fit. Records are deduplicated by contractId because a project on a
+ * tile boundary can be returned by more than one tile.
+ */
+const PAGE_CAP = 1000;
+
+/** Depth guard. 2^12 tiles per axis is far finer than any real cluster needs. */
+const MAX_DEPTH = 12;
+
+interface BBox {
+  minLon: number;
+  minLat: number;
+  maxLon: number;
+  maxLat: number;
+}
+
+const bboxParam = (b: BBox): string =>
+  `${b.minLon.toFixed(6)},${b.minLat.toFixed(6)},${b.maxLon.toFixed(6)},${b.maxLat.toFixed(6)}`;
+
+function quadrants(b: BBox): BBox[] {
+  const midLon = (b.minLon + b.maxLon) / 2;
+  const midLat = (b.minLat + b.maxLat) / 2;
+  return [
+    { minLon: b.minLon, minLat: b.minLat, maxLon: midLon, maxLat: midLat },
+    { minLon: midLon, minLat: b.minLat, maxLon: b.maxLon, maxLat: midLat },
+    { minLon: b.minLon, minLat: midLat, maxLon: midLon, maxLat: b.maxLat },
+    { minLon: midLon, minLat: midLat, maxLon: b.maxLon, maxLat: b.maxLat },
+  ];
+}
 
 interface ApiHit {
   contractId?: string;
@@ -228,60 +268,82 @@ export async function fetchInfrastructureProjects(
   onProgress?: (message: string) => void,
   options: { maxRecords?: number } = {},
 ): Promise<InfrastructureFetchResult> {
+  const warnings: string[] = [];
+  const hitsById = new Map<string, ApiHit>();
+
+  let requests = 0;
+  let nationalTotal = 0;
+
+  async function harvest(box: BBox, depth: number): Promise<void> {
+    if (options.maxRecords && hitsById.size >= options.maxRecords) return;
+
+    const url = `${ENDPOINT}?q=&limit=${PAGE_CAP}&zoom=${depth + 5}&bbox=${bboxParam(box)}`;
+    const response = await fetchJson<ApiResponse>(url, { timeoutMs: 120_000 });
+    requests += 1;
+
+    const result = response.results?.[0];
+    if (!result) {
+      warnings.push(`Empty results envelope for bbox ${bboxParam(box)}.`);
+      return;
+    }
+
+    if (depth === 0) nationalTotal = result.estimatedTotalHits;
+    if (result.estimatedTotalHits === 0) return;
+
+    // Fits under the cap — take it.
+    if (result.estimatedTotalHits <= PAGE_CAP || depth >= MAX_DEPTH) {
+      if (result.estimatedTotalHits > PAGE_CAP) {
+        warnings.push(
+          `Tile ${bboxParam(box)} still holds ${result.estimatedTotalHits} records at max ` +
+            `depth; only the first ${PAGE_CAP} were retrieved.`,
+        );
+      }
+      for (const hit of result.hits) {
+        const id = hit.contractId?.trim();
+        if (id) hitsById.set(id, hit);
+      }
+      onProgress?.(
+        `  tiles: ${requests} · distinct projects: ${hitsById.size}` +
+          (nationalTotal ? `/${nationalTotal}` : ''),
+      );
+      return;
+    }
+
+    // Too many for one response — subdivide. The hits from this probe are
+    // discarded deliberately: they are an arbitrary 1000 of a larger set, and
+    // the children will return them properly.
+    for (const child of quadrants(box)) {
+      await harvest(child, depth + 1);
+    }
+  }
+
+  await harvest({ ...PH_BOUNDS }, 0);
+
   const projects: InfrastructureProject[] = [];
   const quarantined: QuarantineEntry[] = [];
-  const sourceUrls: string[] = [];
-  const warnings: string[] = [];
-
-  let offset = 0;
-  let total = Number.POSITIVE_INFINITY;
   let skippedWithoutKey = 0;
 
-  while (offset < total) {
-    const url = `${ENDPOINT}?limit=${PAGE_SIZE}&offset=${offset}`;
-    sourceUrls.push(url);
-
-    const response = await fetchJson<ApiResponse>(url, { timeoutMs: 120_000 });
-    const result = response.results?.[0];
-
-    if (!result) {
-      warnings.push(`Empty results envelope at offset ${offset}; stopping.`);
-      break;
+  for (const hit of hitsById.values()) {
+    const mapped = mapProject(hit, index);
+    if (!mapped) {
+      skippedWithoutKey += 1;
+      continue;
     }
 
-    total = options.maxRecords
-      ? Math.min(result.estimatedTotalHits, options.maxRecords)
-      : result.estimatedTotalHits;
+    projects.push(mapped.project);
 
-    for (const hit of result.hits) {
-      const mapped = mapProject(hit, index);
-      if (!mapped) {
-        skippedWithoutKey += 1;
-        continue;
-      }
-
-      projects.push(mapped.project);
-
-      // FR-2: a record that did not resolve is quarantined and visible, never
-      // dropped and never counted toward a score.
-      if (mapped.project.psgcCode === null) {
-        quarantined.push({
-          contractId: mapped.project.contractId,
-          sourceRegion: mapped.project.sourceRegion,
-          sourceProvince: mapped.project.sourceProvince,
-          latitude: mapped.project.latitude,
-          longitude: mapped.project.longitude,
-          rationale: mapped.resolution.rationale,
-        });
-      }
-
-      if (projects.length >= total) break;
+    // FR-2: a record that did not resolve is quarantined and visible, never
+    // dropped and never counted toward a score.
+    if (mapped.project.psgcCode === null) {
+      quarantined.push({
+        contractId: mapped.project.contractId,
+        sourceRegion: mapped.project.sourceRegion,
+        sourceProvince: mapped.project.sourceProvince,
+        latitude: mapped.project.latitude,
+        longitude: mapped.project.longitude,
+        rationale: mapped.resolution.rationale,
+      });
     }
-
-    onProgress?.(`  projects: ${projects.length}/${total}`);
-
-    if (result.hits.length === 0) break;
-    offset += result.hits.length;
   }
 
   if (skippedWithoutKey > 0) {
@@ -292,6 +354,17 @@ export async function fetchInfrastructureProjects(
       `${quarantined.length} of ${projects.length} projects did not resolve to a PSGC code.`,
     );
   }
+  if (nationalTotal > 0 && projects.length < nationalTotal) {
+    warnings.push(
+      `Harvested ${projects.length} distinct projects against a national total of ` +
+        `${nationalTotal}. The shortfall is records the bbox tiling did not reach.`,
+    );
+  }
 
-  return { projects, quarantined, sourceUrls, warnings };
+  return {
+    projects,
+    quarantined,
+    sourceUrls: [`${ENDPOINT}?q=&limit=${PAGE_CAP}&bbox=<tiled over Philippine bounds>`],
+    warnings,
+  };
 }
