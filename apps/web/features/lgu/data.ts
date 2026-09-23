@@ -195,35 +195,46 @@ export async function getProvenance(sourceId: string): Promise<Provenance | null
   };
 }
 
-/** A handful of LGUs that actually have projects — the landing page needs entry points. */
-export async function getLgusWithProjects(limit = 24): Promise<
-  { code: string; name: string; level: string; projectCount: number }[]
-> {
+export interface LguProjectSummary {
+  code: string;
+  name: string;
+  level: string;
+  projectCount: number;
+  totalBudget: Centavos;
+}
+
+/**
+ * LGUs that have attributed projects, most first.
+ *
+ * Counts come from the `lgu_project_summary` view rather than from tallying
+ * fetched rows — aggregating client-side over a bounded page silently reports
+ * only whichever localities fall inside the window.
+ */
+export async function getLgusWithProjects(limit = 100): Promise<LguProjectSummary[]> {
   const supabase = await createClient();
 
   const { data, error } = await supabase
-    .from('infrastructure_project')
-    .select('psgc_code, psgc_spine!inner(code, name, level)')
-    .not('psgc_code', 'is', null)
-    .limit(5000)
-    .returns<{ psgc_code: string; psgc_spine: { code: string; name: string; level: string } }[]>();
+    .from('lgu_project_summary')
+    .select('code, name, level, project_count, total_budget_centavos')
+    .order('project_count', { ascending: false })
+    .limit(limit)
+    .returns<
+      {
+        code: string;
+        name: string;
+        level: string;
+        project_count: number;
+        total_budget_centavos: number;
+      }[]
+    >();
 
   if (error) throw new Error(`Failed to load LGU index: ${error.message}`);
 
-  const counts = new Map<string, { code: string; name: string; level: string; projectCount: number }>();
-  for (const row of data ?? []) {
-    const existing = counts.get(row.psgc_code);
-    if (existing) existing.projectCount += 1;
-    else
-      counts.set(row.psgc_code, {
-        code: row.psgc_spine.code,
-        name: row.psgc_spine.name,
-        level: row.psgc_spine.level,
-        projectCount: 1,
-      });
-  }
-
-  return [...counts.values()]
-    .sort((a, b) => b.projectCount - a.projectCount)
-    .slice(0, limit);
+  return (data ?? []).map((row) => ({
+    code: row.code,
+    name: row.name,
+    level: row.level,
+    projectCount: Number(row.project_count),
+    totalBudget: Number(row.total_budget_centavos) as Centavos,
+  }));
 }

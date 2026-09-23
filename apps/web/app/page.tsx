@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { formatCentavos } from '@pcrm/types/money';
 import { Disclaimer } from '../components/ui/Disclaimer';
 import { Provenance } from '../components/ui/Provenance';
 import { getLgusWithProjects, getProvenance } from '../features/lgu/data';
@@ -44,14 +45,20 @@ export default async function HomePage() {
 
       {lgus.length > 0 ? (
         <>
-          <h2>Localities with attributed projects</h2>
+          <h2>
+            Localities with attributed projects{' '}
+            <span style={{ color: 'var(--text-faint)', fontWeight: 400 }}>
+              ({lgus.length})
+            </span>
+          </h2>
           <div className="card-grid">
             {lgus.map((lgu) => (
               <Link key={lgu.code} href={`/lgu/${lgu.code}`} className="card">
                 <span className="card-name">{lgu.name}</span>
                 <span className="card-meta">
-                  {lgu.level} · {lgu.projectCount.toLocaleString('en-PH')} project
-                  {lgu.projectCount === 1 ? '' : 's'}
+                  {lgu.projectCount.toLocaleString('en-PH')} project
+                  {lgu.projectCount === 1 ? '' : 's'} ·{' '}
+                  {formatCentavos(lgu.totalBudget, { compact: true })}
                 </span>
               </Link>
             ))}
